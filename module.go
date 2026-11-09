@@ -1,19 +1,44 @@
-// Package agenda is an Arandu module: one entity with its generated query, one
-// policy that decides about it, one service that orchestrates each use case, and
-// the routes that reach them.
+// Package agenda is an Arandu module: bookings on the agenda of a platform
+// team, for the customers of a multi-tenant application.
+//
+// A customer of a space books a time with the team -- a camera
+// reconfiguration, an installation -- picking a service, a day and one of the
+// free times, and gets a protocol number. A service that asks for a payment
+// leaves the booking waiting for it, holding the slot for a while; the
+// application, which owns the money, tells the module when it settled. Near the
+// time the customer is reminded and asked to confirm or move it, and the team
+// marks it done. The team lists every space's bookings, releases one without a
+// payment as a courtesy, completes it, marks an absence, moves and cancels, and
+// keeps its own services, weekly hours and closures. The two sides are
+// separate: each has its own controllers, its own screens and its own prefix,
+// and the application mounts each where its own session is valid.
+//
+// The module takes no payment and sends no message. A balance, a charge and a
+// Pix are the application's and arandu-wallet's; a WhatsApp message or an e-mail
+// is whatever the application's Notifier does with an Event.
 //
 // The files are laid out by role rather than by layer, so the whole package
 // reads top to bottom:
 //
-//	module.go      -> registration, routes, handlers and migrations
-//	config.go      -> what the application passes in
-//	model.go       -> the entity, and what it may answer with
-//	policy.go      -> who may do what
-//	service.go     -> the use cases, and Model access after authorization
+//	module.go      -> registration, routes and the contract with the framework
+//	config.go      -> what the application passes in, and the route table
+//	contracts.go   -> what the application implements: notifier, directory, subjects
+//	model.go       -> the entities, their own rules, and what they may answer with
+//	schedule.go    -> the team's availability as pure data: which times are free
+//	policy.go      -> who may do what, for a customer and for the team
+//	service.go     -> the customer's use cases, and Model access after authorization
+//	team.go        -> the team's use cases and its settings
+//	app.go         -> the application's hooks and the two tasks
+//	grants.go      -> the places a Grant is issued without a signed-in customer
+//	activity.go    -> what is recorded in arandu-activitylog, and what is told
+//	handlers.go    -> the controllers of both sides
+//	pages.go       -> what the screens are handed
+//	screens.go     -> building it from what a service answered
+//	migrations.go  -> the schema
 //	views.go       -> the files the application takes ownership of
 //
 // An application registers it explicitly. There is no service provider, no
-// container and no discovery: the wiring is three lines somebody wrote, and
+// container and no discovery: the wiring is the lines somebody wrote, and
 // reading them is how they learn what the application is made of.
 package agenda
 
@@ -21,7 +46,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	stdhttp "net/http"
 	"strings"
 
 	"github.com/arandu-io/framework/data"
@@ -29,8 +53,6 @@ import (
 	fhttp "github.com/arandu-io/framework/http"
 	"github.com/arandu-io/framework/http/middleware"
 	"github.com/arandu-io/framework/security"
-	"github.com/arandu-io/hesape/database/migrations"
-	"github.com/arandu-io/hesape/database/schema"
 	"github.com/arandu-io/hesape/view"
 )
 
@@ -39,7 +61,7 @@ import (
 // It implements foundation.Module, which is Name and Routes and nothing else --
 // that pair is the whole public contract between a package and the framework.
 //
-// It also implements foundation.Migratable, because it owns a table, and
+// It also implements foundation.Migratable, because it owns tables, and
 // foundation.Publishable, because it hands view sources to the project. The
 // other optional interfaces are declared beside Module in the framework and are
 // opted into the same way, by implementing them: Bootable to prepare state at
@@ -48,7 +70,9 @@ import (
 // give resources back at shutdown.
 type Module struct {
 	cfg      Config
-	svc      *AgendaService
+	bookings *BookingService
+	team     *TeamService
+	app      *AppService
 	sessions *security.SessionStore
 }
 
@@ -74,7 +98,7 @@ func New(cfg Config, db *data.DB, sessions *security.SessionStore) (*Module, err
 		return nil, err
 	}
 	if db == nil {
-		return nil, errors.New("agenda: New needs a database handle: this package owns a table, and there is no in-memory mode that would let it start without one")
+		return nil, errors.New("agenda: New needs a database handle: this package owns tables, and there is no in-memory mode that would let it start without one")
 	}
 	if sessions == nil {
 		return nil, errors.New("agenda: New needs a session store: every route is mounted behind RequireAuth, which reads it to admit a request and to put who is asking on it")
@@ -82,7 +106,9 @@ func New(cfg Config, db *data.DB, sessions *security.SessionStore) (*Module, err
 	cfg = cfg.withDefaults()
 	return &Module{
 		cfg:      cfg,
-		svc:      NewAgendaService(db),
+		bookings: NewBookingService(db, cfg),
+		team:     NewTeamService(db, cfg),
+		app:      NewAppService(db, cfg),
 		sessions: sessions,
 	}, nil
 }
@@ -93,24 +119,118 @@ func New(cfg Config, db *data.DB, sessions *security.SessionStore) (*Module, err
 // so changing it changes addresses that other code has already written down.
 func (m *Module) Name() string { return "agenda" }
 
-// Routes registers the module's routes under the configured prefix.
-//
-// They are named, so a URL is built from a name rather than written out a
-// second time somewhere else -- two spellings of one address disagree, and the
-// failure when they do is a link to a 404.
-//
-// Every route needs somebody signed in, so the guard is mounted once, on the
-// router they are registered on, rather than route by route: r is replaced by
-// the guarded group before the first registration, and no unguarded router is
-// left in scope for the next route to be added to. RequireAuth sends a request
-// with no session to the sign-in screen, and puts the subject of one that has a
-// session on its context, where a handler reads it with ctx.User.
-func (m *Module) Routes(r *fhttp.Router) {
-	r = r.Group("", middleware.RequireAuth(m.sessions))
+// Bookings is the customer's use cases, for an application that calls them from
+// its own code. Every method asks the policy, so handing it out opens nothing.
+func (m *Module) Bookings() *BookingService { return m.bookings }
 
-	r.Action(stdhttp.MethodGet, m.cfg.Prefix, m.index).Name("agenda.index")
-	r.Action(stdhttp.MethodGet, m.cfg.Prefix+"/{id}", m.show).Name("agenda.show")
-	r.Action(stdhttp.MethodPost, m.cfg.Prefix, m.store).Name("agenda.store")
+// Team is the team's use cases, for an application that calls them from its own
+// code. Every method asks TeamPolicy, so handing it out opens nothing.
+func (m *Module) Team() *TeamService { return m.team }
+
+// App is the application's hooks and tasks. Settle and Find take the Grant the
+// application issued; Remind and ExpireHolds issue their own.
+func (m *Module) App() *AppService { return m.app }
+
+// Settle puts the application's payment on a booking that waits for one. See
+// AppService.Settle.
+func (m *Module) Settle(ctx context.Context, g security.Grant, bookingID, paymentRef string) (*Booking, error) {
+	return m.app.Settle(ctx, g, bookingID, paymentRef)
+}
+
+// Find looks a booking of the Grant's space up by its identifier or protocol.
+// See AppService.Find.
+func (m *Module) Find(ctx context.Context, g security.Grant, ref string) (*Booking, error) {
+	return m.app.Find(ctx, g, ref)
+}
+
+// Remind sends the reminders that are due. See AppService.Remind. The
+// application schedules it every five minutes.
+func (m *Module) Remind(ctx context.Context) (int, error) { return m.app.Remind(ctx) }
+
+// ExpireHolds frees the slots of the bookings whose payment never came. See
+// AppService.ExpireHolds. The application schedules it every five minutes.
+func (m *Module) ExpireHolds(ctx context.Context) (int, error) { return m.app.ExpireHolds(ctx) }
+
+// URLs are the addresses of the routes, for an application that links to them:
+// a menu, an e-mail.
+func (m *Module) URLs() URLs { return URLs{cfg: m.cfg} }
+
+// Routes registers every route of the module: the customer's and the team's.
+//
+// An application that keeps the two sides apart -- and the team's session is
+// valid on its own side only -- registers them separately with CustomerRoutes
+// and TeamRoutes, each on the router group its own guards are on.
+//
+// Every route needs somebody signed in, so the guard is mounted once per side,
+// on the router the routes are registered on, rather than route by route: r is
+// replaced by the guarded group before the first registration, and no unguarded
+// router is left in scope for the next route to be added to. RequireAuth sends
+// a request with no session to the sign-in screen, and puts the subject of one
+// that has a session on its context, where a handler reads it with ctx.User;
+// Config.Middleware runs after it, and Config.TeamMiddleware after that on the
+// team's routes.
+func (m *Module) Routes(r *fhttp.Router) {
+	m.CustomerRoutes(r)
+	m.TeamRoutes(r)
+}
+
+// CustomerRoutes registers the customer's routes alone, under Prefix, for an
+// application that mounts them inside its own side -- a customer's panel --
+// with that side's guards on r.
+func (m *Module) CustomerRoutes(r *fhttp.Router) { m.register(r, false) }
+
+// TeamRoutes registers the team's routes alone, under TeamPrefix, for an
+// application that mounts them inside its operator console with that console's
+// guards on r.
+func (m *Module) TeamRoutes(r *fhttp.Router) { m.register(r, true) }
+
+func (m *Module) register(r *fhttp.Router, team bool) {
+	guards := []fhttp.Middleware{middleware.RequireAuth(m.sessions)}
+	for _, mw := range m.cfg.Middleware {
+		guards = append(guards, mw)
+	}
+	if team {
+		for _, mw := range m.cfg.TeamMiddleware {
+			guards = append(guards, mw)
+		}
+	}
+	r = r.Group("", guards...)
+	handlers := m.handlers()
+	for _, rt := range routeTable(m.cfg) {
+		if rt.team != team {
+			continue
+		}
+		r.Action(rt.method, rt.path, handlers[rt.name]).Name(rt.name)
+	}
+}
+
+// screen builds the page of a screen: the title, the application's name and the
+// CSRF token view.New reads off the request, the sentences, and the chrome the
+// application draws around it.
+func (m *Module) screen(ctx *fhttp.Context, who security.Subject, titleKey string, team bool) (Screen, error) {
+	labels := m.Labels()
+	title := labels.T(titleKey)
+	page := view.New(ctx, title)
+	page.Title = m.documentTitle(title, page.AppName)
+	page.Authenticated = who.ID != ""
+	sc := Screen{Page: page, Labels: labels, URLs: m.URLs(), Location: m.cfg.Zone}
+	if m.cfg.Chrome != nil {
+		chrome, err := m.cfg.Chrome(ctx, ChromeRequest{Title: title, Team: team, Subject: who})
+		if err != nil {
+			return Screen{}, err
+		}
+		sc.chrome = chrome
+	}
+	return sc, nil
+}
+
+// documentTitle is what the browser tab shows for a screen: its title, and the
+// application's name after Config.TitleSeparator when both are there.
+func (m *Module) documentTitle(title, appName string) string {
+	if m.cfg.TitleSeparator == "" || strings.TrimSpace(appName) == "" {
+		return title
+	}
+	return title + m.cfg.TitleSeparator + appName
 }
 
 // PublishCommand is what an application runs to take ownership of the views
@@ -175,121 +295,4 @@ func (m *Module) Boot(context.Context) error {
 			strings.Join(missing, ", "), PublishCommand, strings.Join(imports, ", "))
 	}
 	return nil
-}
-
-// Handlers are thin on purpose: read the input, ask the service, answer. No
-// rule, database handle or Model construction lives here. A handler that
-// reached data directly would skip the service's policy boundary, and the
-// layout makes that visible rather than relying on review.
-//
-// Who is asking comes from ctx.User, which reads the subject RequireAuth put on
-// the request. No handler loads the session again or takes an identity from the
-// input. The second value ctx.User answers is not consulted: behind the guard
-// there is always a subject, and were there none, the zero subject it answers
-// would be refused by security.Authorize before any policy ran.
-//
-// An error from the service is returned as it is, and the router answers it:
-// validation.Errors goes back where the request came from with the messages in
-// the flash, ErrNotFound is 404 because it wraps model.ErrModelNotFound, and a
-// policy refusal is 403. The answer is the status and its standard sentence,
-// never the error's own text -- telling a client why a policy said no tells it
-// what exists, one request at a time, and the reason belongs in the log. Any
-// other error is one nobody expected, and it reaches the error page rather than
-// a 200 with an empty body.
-
-// index answers a page of records.
-func (m *Module) index(ctx *fhttp.Context) error {
-	query := data.Query{
-		Sort:   ctx.Query("sort"),
-		Cursor: ctx.Query("cursor"),
-		Limit:  m.cfg.PageSize,
-	}
-
-	who, _ := ctx.User()
-	records, err := m.svc.List(ctx.Ctx(), who, query)
-	if err != nil {
-		return err
-	}
-
-	// A full page is the only one that can have a successor. A short page is
-	// the last one, and offering a cursor for it would be offering a next page
-	// that comes back empty.
-	cursor := ""
-	if len(records) == m.cfg.PageSize {
-		cursor = records[len(records)-1].ID
-	}
-	return ctx.JSON(stdhttp.StatusOK, collectionFromPointers(records, cursor))
-}
-
-// show answers one record.
-func (m *Module) show(ctx *fhttp.Context) error {
-	who, _ := ctx.User()
-	record, err := m.svc.Find(ctx.Ctx(), who, ctx.Param("id"))
-	if err != nil {
-		return err
-	}
-	return ctx.JSON(stdhttp.StatusOK, resourceFromPointer(record))
-}
-
-// store creates one record.
-func (m *Module) store(ctx *fhttp.Context) error {
-	in := CreateRequest{Name: ctx.Input("name")}
-
-	who, _ := ctx.User()
-	record, err := m.svc.Create(ctx.Ctx(), who, in)
-	if err != nil {
-		return err
-	}
-	return ctx.JSON(stdhttp.StatusCreated, resourceFromPointer(record))
-}
-
-// Migrations declares the schema this module owns.
-//
-// They are returned in the order their names sort in, which is the order they
-// apply in: the name carries the order, and nothing else decides it.
-func (m *Module) Migrations() []foundation.Migration {
-	return []foundation.Migration{createAgendas{}}
-}
-
-// The migration is reversible, and the assertion is here rather than discovered
-// at rollback: the migrator tests for Down with a type assertion, so a Down
-// with the wrong signature would leave a rollback that silently does nothing.
-var _ migrations.ReversibleMigration = createAgendas{}
-
-// createAgendas is the table this module owns, and the index its listing
-// reads by.
-type createAgendas struct{ migrations.BaseMigration }
-
-// GetName is the migration's identity, and it carries the order. It is fixed
-// once the package is published: changing what an applied name means leaves the
-// change missing everywhere it already ran, and nothing says so.
-func (createAgendas) GetName() string { return "20260823_0001_create_agendas" }
-
-// Up creates the table and the index the keyset pagination scans.
-//
-// The Blueprint spells each column for the engine the migration is running on,
-// which is what lets one application develop on a file and deploy on Postgres
-// without a second schema. That used to be written out as SQL here, with a
-// comment explaining that an identifier column is VARCHAR rather than TEXT
-// because it takes part in a key and MySQL refuses TEXT in one without a prefix
-// length -- which is the grammar's job, done by hand in every migration that
-// remembered to.
-//
-// The timestamp has no database default: the value comes from Go.
-func (createAgendas) Up(ctx context.Context, conn migrations.Connection) error {
-	return conn.Schema().Create(ctx, "agendas", func(table *schema.Blueprint) {
-		table.String("id").Primary()
-		table.String("tenant_id")
-		table.String("name")
-		table.Timestamp("created_at")
-
-		// The index matches the ORDER BY of the listing, tenant first. Without
-		// it every page is a scan of every customer's rows.
-		table.Index([]string{"tenant_id", "created_at", "id"}, "agendas_tenant_created_idx")
-	})
-}
-
-// Down drops the table, which takes its index with it.
-func (createAgendas) Down(ctx context.Context, conn migrations.Connection) error {
-	return conn.Schema().DropIfExists(ctx, "agendas")
 }
