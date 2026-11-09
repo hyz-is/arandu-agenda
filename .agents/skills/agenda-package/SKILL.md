@@ -1,17 +1,23 @@
 ---
 name: agenda-package
-description: Install, wire and use the Agenda package (Go, Arandu) in an application. Use when the request is to "install Agenda", "add agenda to the app", "go get github.com/hyz-is/arandu-agenda", "wire it into bootstrap/app.go", "register the module", "use the agenda routes", "everything under /agenda returns 403", "403 forbidden from agenda", "it redirects to /auth/login", "the table does not exist", "no such table", "change where it is mounted", "let admins read it", or when a project's go.mod already requires github.com/hyz-is/arandu-agenda. Covers the three lines of wiring and where each one goes, the Config fields, none of them required, the routes, their names and the session they need, why the policy refuses everything until somebody opens it, and the migration step that is not optional.
+description: Install, wire and use the Arandu Agenda package (Go, Arandu) in an application. Use when the request is to "install Arandu Agenda", "add bookings to the app", "let customers book a time with the team", "go get github.com/hyz-is/arandu-agenda", "wire it into bootstrap/app.go", "register the module", "write the Notifier", "settle a booking when the payment arrives", "schedule the reminders", "everything under /agenda returns 403", "it redirects to /auth/login", "the table does not exist", "no such table", "move the bookings to /painel/agendamentos", or when a project's go.mod already requires github.com/hyz-is/arandu-agenda. Covers the wiring and where each line goes, the Config fields, the two sides and their prefixes, the actions to declare in arandu-permission, the Notifier, Directory and SubjectResolver the application writes, Settle and the two tasks to schedule, the migration step that is not optional, and the views to publish.
 license: MIT
 metadata:
   audience: app
 ---
 
-# Using Agenda
+# Using Arandu Agenda
 
-An Arandu package with one entity, its own table, its own routes and its own
-policy. It is registered by hand — there is no service provider, no container
-and no discovery, so if a line is not written in the application, it does not
-happen.
+Bookings on the agenda of a platform team, for a multi-tenant application: a
+customer of a space picks a service, a day and a free time, pays in advance when
+the service asks for it, is reminded, and the team marks the visit as done. Two
+separate sides, each with its own routes and screens. It is registered by hand:
+there is no service provider, no container and no discovery, so if a line is not
+written in the application, it does not happen.
+
+**It takes no payment and sends no message.** Money is the application's and
+arandu-wallet's; a message is whatever the application's `Notifier` does with an
+`Event`.
 
 ## Install
 
@@ -19,12 +25,12 @@ happen.
 go get github.com/hyz-is/arandu-agenda
 ```
 
-## The three lines of wiring, and where each one goes
+## The wiring, and where each line goes
 
-All three are in `bootstrap/app.go`. Nothing else in the application changes,
+All of it is in `bootstrap/app.go`. Nothing else in the application changes,
 and `aru make:module` does not edit this file for you.
 
-The import, with the other module imports:
+The import:
 
 ```go
 import (
@@ -32,26 +38,35 @@ import (
 )
 ```
 
-The construction, in `Build`, after the session store exists and before
-`k.Register`:
+The construction, in `Build`, after the session store and the activity log exist
+and before `k.Register`:
 
 ```go
-	agendaModule, err := agenda.New(agenda.Config{}, db, sessions)
+	zone, err := time.LoadLocation("America/Sao_Paulo")
+	if err != nil {
+		return App{}, err
+	}
+	agendaModule, err := agenda.New(agenda.Config{
+		TeamTenant: cfg.Auth.Tenant, // the tenant the platform team signs in to
+		Zone:       zone,            // the team's day is written in it
+		Notifier:   agendaNotifier{whatsapp: whatsapp},
+		Activity:   activityModule.Logger(),
+	}, db, sessions)
 	if err != nil {
 		return App{}, err
 	}
 ```
 
-And the registration, inside the `k.Register(...)` call already there:
+The registration, inside the `k.Register(...)` call already there:
 
 ```go
 		agendaModule,
 ```
 
-`New` returns an error rather than starting half-wired. It refuses a
-configuration that cannot work, a nil database handle and a nil session store,
-so a wiring mistake costs one restart instead of arriving as a nil dereference
-on the first request that needed it.
+`New` refuses a configuration that cannot work, a nil database handle and a nil
+session store, so a wiring mistake costs one restart. `TeamTenant` and `Zone`
+are the two required settings; the customers' tenant is nothing the
+configuration names, because it comes from the Grant of whoever is signed in.
 
 ## Then run the migrations
 
@@ -59,126 +74,96 @@ on the first request that needed it.
 aru migrate
 ```
 
-Not optional, and not automatic. The package owns a table, which is why its
-`arandu.mod.toml` declares `migrations = true` — that declaration is how an
-installer finds out before deploying rather than from the first request.
-
-`aru migrate` is a step in the pipeline and never a call at the start of the
-process: with N replicas, N migrations race each other.
+Not optional, and not automatic. The package owns five tables, which is why its
+`arandu.mod.toml` declares `migrations = true`. `aru migrate` is a step in the
+pipeline and never a call at the start of the process.
 
 **Symptom to recognise:** `no such table`, or `relation does not exist`, from a
 route that authorized correctly. The migration has not run.
 
-## Configuration
+## The two sides
 
-| field | required | meaning |
-| --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/agenda` |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200 |
+`Prefix` (default `/agenda`) is the customer's, `TeamPrefix` (default
+`/admin/agenda`) is the team's. `agenda.PortuguesePaths` writes the segments in
+Portuguese. Every route sits behind `RequireAuth`, mounted by the package
+itself: a request with no session is sent to `/auth/login`, and comes back to
+the address it asked for after signing in.
 
-`agenda.Config{}` is a complete configuration. There is no tenant to pass:
-every route needs a session, and the tenant of every statement comes from
-`data.Tenant(g)`, off the Grant of whoever is signed in. Passing a value the
-request named — a path segment, a header, a subdomain read off the URL — is what
-`TestNoTenantIsReadOutOfTheRequest` fails on in the package. In an application
-the same mistake is `aru doctor`'s `tenant-from-request`; in a package nothing
-but the package's own suite looks.
+An application whose two sides are two routers mounts them itself:
+`agendaModule.CustomerRoutes(panel)` and `agendaModule.TeamRoutes(console)`.
+`Config.Middleware` runs after `RequireAuth` on both sides and
+`Config.TeamMiddleware` on the team's alone. When arandu-permission administers
+the permissions, mount its `Roles()` in `Middleware`: it fills the subject's
+actions on each request.
 
-`PageSize` above 200 is an error from `New`, not a silent 200. A number somebody
-wrote and did not get is worse than a number somebody wrote and was told about.
+**Symptom to recognise:** every route redirects to `/auth/login`. Nobody is
+signed in on that request: the cookie did not arrive, or the session store
+passed to `New` is not the one the application signs people in with.
 
-## Routes
+## Every route refuses everybody until the actions are granted
 
-| method | path | name |
-| --- | --- | --- |
-| `GET` | `/agenda` | `agenda.index` |
-| `GET` | `/agenda/{id}` | `agenda.show` |
-| `POST` | `/agenda` | `agenda.store` |
-
-Every route sits behind `RequireAuth`, mounted by the package itself. A request
-with no session is sent to `/auth/login` — 303, or `HX-Redirect` for an htmx
-request — and comes back to the address it asked for after signing in. That is
-the sign-in screen the starter kit publishes; an application without one sees
-a 404 there.
-
-**Symptom to recognise:** every route of the package redirects to
-`/auth/login`. Nobody is signed in on that request: the session cookie did not
-arrive, or the session store passed to `New` is not the one the application
-signs people in with.
-
-Build URLs from the names, never by writing the path a second time. `aru
-route:list` shows them grouped by module. Under a custom `Prefix` the paths move
-and the names do not.
-
-`GET /agenda` answers `{"data": {"items": [...]}}`, and adds
-`"next_cursor"` beside `data` when a further page exists. Pass it back as
-`?cursor=`. A page shorter than `PageSize` is the last one and carries no
-cursor.
-
-`TenantID` is not in any response. That is deliberate: it names a customer's
-identifier and the response is a declared list of fields rather than the entity.
-
-## Every route refuses everybody, until you open the policy
-
-This is the state the package ships in, and it is not a bug to work around.
-`AgendaPolicy` denies every action and has no branch that allows one:
-
-```
-403 Forbidden
-```
-
-is what a correctly installed, correctly migrated, correctly wired package
-answers to an administrator who is signed in, on day one.
-
-Opening an action means writing the rule that opens it, in the package's
-`policy.go`, inside the block that says so:
+The policies deny every action and have no branch that opens one by role. Put
+the actions in the permission catalogue and grant them:
 
 ```go
-	// arandu:begin custom
-	if a == AgendaView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
+permission.Config{Actions: append(append(app.Actions(), permission.Actions()...), agenda.Actions()...)}
+// and, in the platform team's catalogue only:
+//   agenda.TeamActions()
 ```
 
-What is not written there stays closed, including every action added later.
-There are five actions — `AgendaView`, `AgendaList`, `AgendaCreate`,
-`AgendaUpdate`, `AgendaDelete` — and opening one opens exactly one.
+`agenda.book`, `agenda.view_own`, `agenda.view_space` and `agenda.change` are the
+customer's; `agenda.view_all`, `agenda.manage` and `agenda.configure` are the
+team's, and `TeamPolicy` refuses them to any subject outside `Config.TeamTenant`.
+`agenda.settle` and `agenda.run_tasks` are nobody's: the application's code and
+the scheduler issue Grants for them.
 
-**Do not open it from the application.** There is no hook, no override and no
-config flag for the policy, and adding one would be a second place where
-authorization is decided. If the rules this application needs are not the rules
-the package ships, the change belongs in the package.
+**Symptom to recognise:** `403` on a signed-in administrator. They hold no
+action. Grant one, do not look for a role check to add.
 
-## What the answers mean
+## What the application writes
 
-| status | what happened |
-| --- | --- |
-| `303` to `/auth/login` | there is no session on the request |
-| `403` | the policy refused, or no rule allows the action yet |
-| `404` | no row with that id in this tenant |
-| `303` back to the page the request came from | the input was rejected; the messages and what was typed are in the flash |
-| `422` `application/problem+json` | the input was rejected and the request asked for JSON; the messages are in `errors`, keyed by field |
+- **`Notifier`**: `Notify(ctx, agenda.Event) error`, sending the reminder, the
+  confirmation, the cancellation. Its failure is logged without personal text and
+  never undoes the change. The `EventReminder` carries `ConfirmURL` and
+  `RescheduleURL` as paths; put the host in front.
+- **`Directory`** (optional): `Person(ctx, tenant, id)`, for names.
+- **`SubjectResolver`** (optional): checks that the thing a booking is about --
+  `"camera"`, an identifier -- is the tenant's, and gives its label.
+- **`PaymentURL`** (optional): where the customer pays a booking that waits for
+  it. `URLs().NewFor("reconfiguracao", agenda.BookingSubject{Type: "camera", ID: "42", Label: "Portaria"})`
+  links to the form with the booking already about something.
 
-A request that asks for JSON (an `Accept` naming `application/json`, or an XHR
-that is not htmx) gets the 403 and the 404 as problem documents too. The
-sign-in redirect is the same for every client.
+## When the payment settles
 
-The package does not choose these: its handlers return what the service
-returned, and the framework's router answers it. A refusal carries no detail
-beyond the status and its standard sentence. Telling a client why a policy said
-no tells it what exists and what does not, one request at a time. The reason is
-in the log.
+```go
+//arandu:system-grant the webhook was verified; the tenant is the booking's own
+grant := security.SystemGrant(agenda.AgendaSettle, booking.Tenant)
+_, err := agendaModule.Settle(ctx, grant, bookingID, paymentRef)
+```
 
-Anything else is a 500 and the framework's error page in development. The
-package returns unexpected errors rather than swallowing them, so a route that
-answers 200 with an empty body is not something it does.
+Idempotent for the same reference. `agenda.ErrSlotTaken` means the hold lapsed
+and somebody took the slot: refund or book again. `agenda.ErrNotSettleable`
+means cancelled, or already settled with another reference: refund.
 
-## Reporting a problem
+## Schedule the two tasks every five minutes
 
-Issues and pull requests go to the repository the module path names,
-`github.com/hyz-is/arandu-agenda`, which belongs to `hyz-is`. A vulnerability goes to the
-private advisory form named in that repository's `SECURITY.md`, and never into
-an issue.
+```go
+agendaModule.Remind(ctx)      // the reminders that are due, once each
+agendaModule.ExpireHolds(ctx) // the unpaid bookings past their hold
+```
 
-MIT licensed. Copyright HYZIS.
+Without `Remind` nobody is reminded; without `ExpireHolds` the statuses of the
+lapsed holds stay `awaiting_payment` (their slots are free anyway) and the
+customer is not told.
+
+## Publish the views
+
+```bash
+aru vendor:publish --tag=view --apply
+aru view:build
+```
+
+and import the two directories it wrote into
+(`storage/framework/views/modules/agenda` and `.../admin`) in
+`bootstrap/app.go`. Without them the module refuses to boot and names the
+missing views, the command and the imports.

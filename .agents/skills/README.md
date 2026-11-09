@@ -24,7 +24,7 @@ names the situation you are in rather than the topic it covers.
 The last one has a different audience from the other three, and that is on
 purpose: it travels with the package so that an assistant working in somebody
 else's project — the one running `go get` — has the wiring, the migration step
-and the closed policy in front of it instead of guessing.
+and the actions to grant in front of it instead of guessing.
 
 Its frontmatter says so, under `metadata`, with `audience: app`. That line is
 what `aru skills:sync` reads to copy the skill into an application whose
@@ -40,7 +40,7 @@ package cloned somewhere else never grows a folder tree imitating one.
 
 The audience of the first three is somebody changing the package. The common
 failure modes are a provider, a container lookup, a hand edit to the generated
-`AgendaQuery.go`, a rule of the entity written into the Service instead of the
+`BookingQuery.go`, a rule of the entity written into the Service instead of the
 custom block of `model.go`, a handler that loads the session or maps an error to
 a status itself, a CRUD Repository beside the Model, a tenant read from the URL,
 or a Policy branch that returns nil for administrators "for now". None belongs

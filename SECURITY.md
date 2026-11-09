@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-The latest minor release of Agenda receives security fixes. Older minor
+The latest minor release of Arandu Agenda receives security fixes. Older minor
 releases do not: a published Go module version is immutable, so a fix is a new
 release rather than a moved tag.
 
@@ -36,7 +36,16 @@ particular:
 - a query whose tenant scope is disabled, or a tenant taken from anywhere but
   `data.Tenant(g)`;
 - a `Grant` that can be produced without a policy returning nil;
-- a field reaching a response that `Resource` does not list.
+- a field reaching a response that the declared lists in `model.go` do not name,
+  and above all the team's note, who released a booking and why, or the name,
+  note or space of another customer's booking reaching a customer;
+- a Grant built outside `grants.go`, or a team action reaching a subject outside
+  `Config.TeamTenant`;
+- the table that reads every tenant reached for more than the columns that say
+  when a place is taken, or before a policy or the task Grant answered;
+- a booking taken twice for the last place, or a payment settling a booking
+  twice, or one for a slot that is not its own;
+- text a person typed reaching a page unescaped, the activity log or a log line.
 
 ## What is not
 
