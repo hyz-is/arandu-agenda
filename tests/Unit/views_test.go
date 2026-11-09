@@ -44,7 +44,7 @@ func module(t *testing.T) *agenda.Module {
 	t.Helper()
 
 	sessions := security.NewSessionStore([]byte(sessionKey), time.Hour, false, security.NewMemoryBackend())
-	m, err := agenda.New(agenda.Config{}, data.Wrap(nil, data.DialectSQLite), sessions)
+	m, err := agenda.New(agenda.Config{TeamTenant: "platform", Zone: time.UTC}, data.Wrap(nil, data.DialectSQLite), sessions)
 	if err != nil {
 		t.Fatalf("building the module: %v", err)
 	}

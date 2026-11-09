@@ -139,61 +139,101 @@ func firstCallTo(body *ast.BlockStmt, name string) token.Pos {
 	return found
 }
 
+// services are the types whose exported methods are the use cases of a side.
+var services = map[string]bool{"BookingService": true, "TeamService": true, "AppService": true}
+
+// deciders are what a use case may ask before it reaches the Model, and each is
+// either security.Authorize itself or a helper that is checked below to call
+// it, or to issue the one Grant that needs no Policy.
+var deciders = map[string]bool{
+	"Authorize": true, "authorizeView": true, "authorizeSlots": true, "reach": true, "appGrant": true, "taskGrant": true,
+}
+
+// modelReaches are the calls through which a use case first touches data: the
+// generated queries, the write terminals, and the helpers of core that run
+// statements.
+var modelReaches = map[string]bool{
+	"Bookings": true, "Services": true, "Hours": true, "Closures": true, "Counters": true,
+	"Save": true, "Delete": true, "Restore": true, "Touch": true,
+	"schedule": true, "move": true, "lock": true, "bump": true, "offered": true, "holdAgain": true,
+}
+
 // TestEveryServiceMethodAuthorizesBeforeTheModel holds the mandatory path on
-// every exported use case rather than on the three that exist today.
+// every exported use case of both sides rather than on the ones that exist
+// today.
 //
 // A nil-database denial test proves the closed path. This syntax audit is its
 // twin for an allowed path: Model construction is visible in the method body,
-// and moving it above Authorize fails even when no terminal is executed.
+// and moving it above the decision fails even when no terminal is executed.
 func TestEveryServiceMethodAuthorizesBeforeTheModel(t *testing.T) {
 	t.Parallel()
 
-	audited := 0
+	audited := map[string]int{}
 	for _, source := range auditedFiles(t) {
 		for _, declaration := range source.file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil || receiverType(function) != "AgendaService" ||
-				!function.Name.IsExported() {
+			if !ok || function.Body == nil || !services[receiverType(function)] || !function.Name.IsExported() {
 				continue
 			}
-			audited++
+			audited[receiverType(function)]++
 
-			decided := firstCallTo(function.Body, "Authorize")
-			reach := firstModelReach(function.Body)
+			decided := firstCallToAny(function.Body, deciders)
+			reach := firstCallToAny(function.Body, modelReaches)
 			if decided == token.NoPos {
-				t.Errorf("%s: %s never calls security.Authorize, so no Policy decided whether the Model may run",
-					source.path, function.Name.Name)
-			}
-			if reach == token.NoPos {
-				t.Errorf("%s: %s never reaches the generated query, so this audit found no data boundary to order",
-					source.path, function.Name.Name)
+				t.Errorf("%s: %s never asks a Policy, so nothing decided whether the Model may run", source.path, function.Name.Name)
 			}
 			if decided != token.NoPos && reach != token.NoPos && decided > reach {
-				t.Errorf("%s: %s reaches the Model before security.Authorize",
-					source.path, function.Name.Name)
+				t.Errorf("%s: %s reaches the Model before it is authorized", source.path, function.Name.Name)
 			}
 		}
 	}
-	if audited == 0 {
-		t.Fatal("no exported AgendaService method was found, so this test proved nothing")
+	for service := range services {
+		if audited[service] == 0 {
+			t.Fatalf("no exported %s method was found, so this test proved nothing", service)
+		}
 	}
 }
 
-// firstModelReach is where a Service first constructs the generated query or
-// calls a promoted write terminal. Agendas itself counts: moving only its
-// construction before Authorize is the mutation this audit exists to reject.
-func firstModelReach(body *ast.BlockStmt) token.Pos {
-	terminals := map[string]bool{
-		"Save": true, "Delete": true, "Restore": true, "Touch": true,
+// TestTheHelpersThatDecideActuallyDecide holds the helpers the audit above
+// trusts: each of the three that ask a policy calls security.Authorize, and the
+// two that check or issue a Grant live in grants.go, where every Grant without a
+// customer is held to.
+func TestTheHelpersThatDecideActuallyDecide(t *testing.T) {
+	t.Parallel()
+
+	grantHelpers := map[string]bool{"appGrant": true, "taskGrant": true}
+	found := map[string]bool{}
+	for _, source := range auditedFiles(t) {
+		for _, declaration := range source.file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil || !deciders[function.Name.Name] || function.Name.Name == "Authorize" {
+				continue
+			}
+			found[function.Name.Name] = true
+			if grantHelpers[function.Name.Name] {
+				if source.path != "grants.go" {
+					t.Errorf("%s: %s lives outside grants.go", source.path, function.Name.Name)
+				}
+				continue
+			}
+			if firstCallTo(function.Body, "Authorize") == token.NoPos {
+				t.Errorf("%s: %s is trusted to decide and never calls security.Authorize", source.path, function.Name.Name)
+			}
+		}
 	}
+	for name := range deciders {
+		if name != "Authorize" && !found[name] {
+			t.Errorf("the decider %s is listed and does not exist", name)
+		}
+	}
+}
+
+// firstCallToAny is where a body first calls anything by one of these names.
+func firstCallToAny(body *ast.BlockStmt, names map[string]bool) token.Pos {
 	found := token.NoPos
 	ast.Inspect(body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		name := calledName(call)
-		if name != "Agendas" && !terminals[name] {
+		if !ok || !names[calledName(call)] {
 			return true
 		}
 		if found == token.NoPos || call.Pos() < found {
@@ -248,41 +288,190 @@ func TestNoTenantIsReadOutOfTheRequest(t *testing.T) {
 	}
 }
 
-// TestTheServiceWritesTenantOnlyFromTheGrant holds the write half of tenant
+// TestTheTenantIsWrittenOnlyFromTheGrant holds the write half of tenant
 // isolation. The proposed value is policy input; the value persisted after
-// Authorize must take TenantID directly from data.Tenant(g).
-func TestTheServiceWritesTenantOnlyFromTheGrant(t *testing.T) {
+// Authorize must take TenantID directly from data.Tenant(g), and a tenant_id
+// written by key must come from a variable the same function filled from it.
+func TestTheTenantIsWrittenOnlyFromTheGrant(t *testing.T) {
 	t.Parallel()
 
-	audited := 0
+	assignments, keyed := 0, 0
 	for _, source := range auditedFiles(t) {
 		for _, declaration := range source.file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil || receiverType(function) != "AgendaService" {
+			if !ok || function.Body == nil {
 				continue
 			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
-				assignment, ok := node.(*ast.AssignStmt)
-				if !ok {
-					return true
-				}
-				for i, target := range assignment.Lhs {
-					if i >= len(assignment.Rhs) || selectorName(target) != "TenantID" {
-						continue
+				switch node := node.(type) {
+				case *ast.AssignStmt:
+					for i, target := range node.Lhs {
+						if i >= len(node.Rhs) || selectorName(target) != "TenantID" {
+							continue
+						}
+						// A model's field is written; a value read back from the
+						// row (the tenant of a booking found by the team) is not
+						// a write the package does, and is the only exception: it
+						// is passed to scopedGrant, which validates it.
+						assignments++
+						call, ok := node.Rhs[i].(*ast.CallExpr)
+						if !ok || calledName(call) != "Tenant" {
+							t.Errorf("%s: %s writes TenantID from something other than data.Tenant(g)", source.path, function.Name.Name)
+						}
 					}
-					audited++
-					call, ok := assignment.Rhs[i].(*ast.CallExpr)
-					if !ok || calledName(call) != "Tenant" {
-						t.Errorf("%s: %s writes TenantID from something other than data.Tenant(g)",
-							source.path, function.Name.Name)
+				case *ast.KeyValueExpr:
+					literal, ok := node.Key.(*ast.BasicLit)
+					if !ok || literal.Kind != token.STRING || literal.Value != `"tenant_id"` {
+						return true
+					}
+					keyed++
+					if _, ok := node.Value.(*ast.Ident); !ok || firstCallTo(function.Body, "Tenant") == token.NoPos {
+						t.Errorf("%s: %s writes tenant_id by key from something other than data.Tenant(g)", source.path, function.Name.Name)
 					}
 				}
 				return true
 			})
 		}
 	}
-	if audited == 0 {
-		t.Fatal("no Service tenant assignment was found, so this test proved nothing")
+	if assignments == 0 {
+		t.Fatalf("found %d tenant assignments and %d keyed ones, so this test proved nothing", assignments, keyed)
+	}
+}
+
+// TestAGrantWithoutACustomerIsIssuedInGrantsGoAlone holds the two places a
+// Grant is built without a Policy answering for it to one file, and each of
+// them to a comment that says what decided first. A third place is a decision
+// to take in review, not a line to find in a diff.
+func TestAGrantWithoutACustomerIsIssuedInGrantsGoAlone(t *testing.T) {
+	t.Parallel()
+
+	root := packageRoot(t)
+	calls := 0
+	for _, source := range auditedFiles(t) {
+		ast.Inspect(source.file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || (calledName(call) != "SystemGrant" && calledName(call) != "SystemGrantActing") {
+				return true
+			}
+			calls++
+			if source.path != "grants.go" {
+				t.Errorf("%s: builds a system Grant outside grants.go", source.path)
+			}
+			return true
+		})
+	}
+	if calls != 2 {
+		t.Errorf("grants.go issues %d system Grants, want the two it documents", calls)
+	}
+
+	body, err := os.ReadFile(filepath.Join(root, "grants.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(body), "//arandu:system-grant "); got != 2 {
+		t.Errorf("grants.go marks %d system Grants with //arandu:system-grant and a reason, want 2", got)
+	}
+	// A scoped Grant is checked against the realm Grant it comes from, every one
+	// is for a tenant that can be one, and the application's Grant is checked
+	// for the action and the tenant it names.
+	for _, want := range []string{"realm.Check(a)", "security.ValidTenant(realm)", "security.ValidTenant(tenant)", "g.Check(AgendaSettle)"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("grants.go does not contain %q, so a Grant could be issued or trusted unchecked", want)
+		}
+	}
+}
+
+// platformReaders are the files that may import the table that reads every
+// tenant, and what each is held to when it calls it.
+var platformReaders = map[string]bool{"team.go": true, "service.go": true, "app.go": true, "model.go": true}
+
+// TestOnlyThreeFilesReadEveryTenant holds the reads that cross tenants to the
+// files that need them and to a decision made first. The team's two reads and
+// the tasks' two come after a Policy or the task Grant answered; the customer's
+// one, the availability of a day, reads only the columns that say when a place
+// is taken.
+func TestOnlyThreeFilesReadEveryTenant(t *testing.T) {
+	t.Parallel()
+
+	reads := map[string]int{}
+	for _, source := range auditedFiles(t) {
+		for _, imported := range source.file.Imports {
+			if !strings.HasSuffix(strings.Trim(imported.Path.Value, `"`), "/internal/platform") {
+				continue
+			}
+			if !platformReaders[source.path] {
+				t.Errorf("%s imports the table that reads every tenant", source.path)
+			}
+		}
+		for _, declaration := range source.file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			reach := token.NoPos
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok || calledName(call) != "Bookings" {
+					return true
+				}
+				if owner, ok := call.Fun.(*ast.SelectorExpr); ok {
+					if pkg, ok := owner.X.(*ast.Ident); ok && pkg.Name == "platform" && (reach == token.NoPos || call.Pos() < reach) {
+						reach = call.Pos()
+					}
+				}
+				return true
+			})
+			if reach == token.NoPos {
+				continue
+			}
+			reads[source.path]++
+			switch source.path {
+			case "team.go", "app.go":
+				if decided := firstCallToAny(function.Body, deciders); decided == token.NoPos || decided > reach {
+					t.Errorf("%s: %s reads every tenant's bookings before a Policy or the task Grant answered", source.path, function.Name.Name)
+				}
+			case "service.go":
+				// The helper the customer's use cases share. It is reached after
+				// they authorized, and it reads the occupancy columns alone.
+				var body strings.Builder
+				ast.Inspect(function.Body, func(node ast.Node) bool {
+					if selector, ok := node.(*ast.SelectorExpr); ok {
+						body.WriteString(spelled(selector) + " ")
+					}
+					return true
+				})
+				if function.Name.Name != "schedule" || !strings.Contains(body.String(), "platform.OccupancyColumns") {
+					t.Errorf("service.go: %s reads every tenant's bookings other than through schedule and OccupancyColumns", function.Name.Name)
+				}
+			default:
+				t.Errorf("%s: %s reads every tenant's bookings", source.path, function.Name.Name)
+			}
+		}
+	}
+	if reads["team.go"] != 2 || reads["app.go"] != 2 || reads["service.go"] != 1 {
+		t.Errorf("reads of every tenant's bookings: %v; want team.go 2 (the list and the lookup that finds a booking's tenant), app.go 2 (the two tasks) and service.go 1 (the availability)", reads)
+	}
+}
+
+// TestNoTextBecomesMarkup holds that nothing a person typed is converted into
+// markup. The screens draw every value through the view, which escapes it, and
+// the only HTML they write unescaped is what a Kyse component returns. A
+// conversion to template.HTML in this package would be the one place that
+// changes, so it fails here and is a decision to take in review.
+func TestNoTextBecomesMarkup(t *testing.T) {
+	t.Parallel()
+
+	for _, source := range auditedFiles(t) {
+		ast.Inspect(source.file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || calledName(call) != "HTML" {
+				return true
+			}
+			if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selectorName(selector.X) == "template" {
+				t.Errorf("%s: writes markup with template.HTML(...)", source.path)
+			}
+			return true
+		})
 	}
 }
 
