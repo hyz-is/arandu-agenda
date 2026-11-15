@@ -414,7 +414,7 @@ func (m *Module) teamServiceUpdate(ctx *fhttp.Context) error {
 	return ctx.Redirect(m.URLs().TeamServices())
 }
 
-// teamServiceDelete removes a service. A browser asks for it through htmx, which
+// teamServiceDelete removes a service. A browser asks for it through YPY, which
 // takes the row out of the table when the answer is a 200.
 func (m *Module) teamServiceDelete(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
@@ -557,7 +557,7 @@ func (m *Module) teamClosureDelete(ctx *fhttp.Context) error {
 	return deleted(ctx)
 }
 
-// deleted answers a removal: the row is taken out of the table by htmx when the
+// deleted answers a removal: the row is taken out of the table by YPY when the
 // answer is a 200, and a client reads the JSON.
 func deleted(ctx *fhttp.Context) error {
 	if ctx.WantsJSON() {

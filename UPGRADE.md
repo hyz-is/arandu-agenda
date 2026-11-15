@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Nothing to change in the code. The delete buttons of the team's lists (services,
+hours, closures) are drawn by Kyse's `DeleteRow`, which draws `ypy-delete` now,
+so the Kyse release that carries YPY is the one these views are compiled
+against: with an older Kyse the published-view compile test, which looks for
+`ypy-delete`, fails. An application that already published the views keeps its
+own and gets the new buttons when it publishes them again.
+
 ## v0.1.0
 
 First release: nothing to upgrade from. A new installation reads the README, in
