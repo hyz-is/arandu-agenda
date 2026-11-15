@@ -50,7 +50,7 @@ package's own suite.
 
 ```toml
 name = "hyz-is/agenda"
-framework = ">= 0.67"
+framework = ">= 0.69"
 profiles = ["conventional", "performance"]
 
 [permissions]
@@ -68,7 +68,7 @@ the suite. The module sends no message and takes no payment, which is why `netwo
 `false`; an outbound call added here changes the manifest in the same commit.
 
 The `framework` line is a floor and a second declaration of what `go.mod` says:
-`framework = ">= 0.67"`. Move both together when you bump.
+`framework = ">= 0.69"`. Move both together when you bump.
 
 ## Dependencies
 
