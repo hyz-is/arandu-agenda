@@ -52,7 +52,7 @@ arandu-permission.
 
 An Arandu application registers a module explicitly. There is no service
 provider, no container and no discovery, so these are the lines to paste into
-`bootstrap/app.go` and there are no others.
+`bootstrap/app.go`, and the views add imports below.
 
 The import, with the other module imports:
 
@@ -62,13 +62,17 @@ import (
 )
 ```
 
-The construction, in `Build`, after the session store and the activity log
-exist and before `k.Register`:
+The construction, in `App`, once `NewAppServiceProvider` has returned and the
+activity log exists. `New` refuses a wiring that cannot work and `Configure` has
+no way to return that error, so the module is built where the error can leave;
+the database and the session store are the ones the framework built from the
+configuration:
 
 ```go
 	zone, err := time.LoadLocation("America/Sao_Paulo")
 	if err != nil {
-		return App{}, err
+		_ = drivers.Close()
+		return nil, err
 	}
 	agendaModule, err := agenda.New(agenda.Config{
 		// The tenant the platform team signs in to: the operator console's
@@ -103,16 +107,20 @@ exist and before `k.Register`:
 		// team's alone.
 		Middleware:     []func(http.Handler) http.Handler{permissionModule.Roles()},
 		TeamMiddleware: []func(http.Handler) http.Handler{consoleGuard},
-	}, db, sessions)
+	}, drivers.DB, drivers.Sessions)
 	if err != nil {
-		return App{}, err
+		_ = drivers.Close()
+		return nil, err
 	}
 ```
 
-And the registration, inside the `k.Register(...)` call already there:
+And the registration, in the `WithProviders(...)` chain the builder is made of:
 
 ```go
-		agendaModule,
+	return Configure(cfg, drivers, app).
+		WithProviders(agendaModule).
+		WithVersion(version, commit).
+		Create()
 ```
 
 An application that keeps the two sides on different routers mounts them

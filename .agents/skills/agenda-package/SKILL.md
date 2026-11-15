@@ -38,29 +38,37 @@ import (
 )
 ```
 
-The construction, in `Build`, after the session store and the activity log exist
-and before `k.Register`:
+The construction, in `App`, once `NewAppServiceProvider` has returned and the
+activity log exists. `New` refuses a wiring that cannot work and `Configure` has
+no way to return that error, so the module is built where the error can leave;
+the database and the session store are the ones the framework built from the
+configuration:
 
 ```go
 	zone, err := time.LoadLocation("America/Sao_Paulo")
 	if err != nil {
-		return App{}, err
+		_ = drivers.Close()
+		return nil, err
 	}
 	agendaModule, err := agenda.New(agenda.Config{
 		TeamTenant: cfg.Auth.Tenant, // the tenant the platform team signs in to
 		Zone:       zone,            // the team's day is written in it
 		Notifier:   agendaNotifier{whatsapp: whatsapp},
 		Activity:   activityModule.Logger(),
-	}, db, sessions)
+	}, drivers.DB, drivers.Sessions)
 	if err != nil {
-		return App{}, err
+		_ = drivers.Close()
+		return nil, err
 	}
 ```
 
-The registration, inside the `k.Register(...)` call already there:
+And the registration, in the `WithProviders(...)` chain the builder is made of:
 
 ```go
-		agendaModule,
+	return Configure(cfg, drivers, app).
+		WithProviders(agendaModule).
+		WithVersion(version, commit).
+		Create()
 ```
 
 `New` refuses a configuration that cannot work, a nil database handle and a nil
